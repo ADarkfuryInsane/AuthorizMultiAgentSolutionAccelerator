@@ -16,6 +16,9 @@
     },
     "imagesBuilt": {
       "value": "${IMAGES_BUILT}"
+    },
+    "existingResourceGroupName": {
+      "value": "${AZURE_RESOURCE_GROUP}"
     }
   }
 }

@@ -1,149 +1,196 @@
-"""Synthesis Decision Hosted Agent — refreshed Foundry Hosted Agents preview.
+"""Synthesis Decision Hosted Agent.
 
 Synthesizes outputs from Compliance, Clinical, and Coverage agents into
 a final APPROVE or PEND recommendation using gate-based evaluation,
 weighted confidence scoring, and a structured audit trail.
 
-Deployed as a Foundry Hosted Agent using the refreshed preview stack:
-  - FoundryChatClient (agent-framework-foundry) — model bridge
-  - Agent (agent-framework-core)                — agent definition + tools
-  - ResponsesHostServer (agent-framework-foundry-hosting) — HTTP host
+Hosted using:
+  - FoundryChatClient
+  - Agent
+  - SkillsProvider
+  - ResponsesHostServer
 
-No MCP connections required — synthesis is pure reasoning over agent outputs.
-Structured output is enforced via default_options={"response_format": SynthesisOutput},
-which the host passes through to every agent.run() call. The `store: False`
-option is required by the refreshed preview because the platform now manages
-conversation history.
-
-Migration ref: https://learn.microsoft.com/azure/foundry/agents/how-to/migrate-hosted-agent-preview
+Structured output is enforced through SynthesisOutput.
 """
+
 import os
 from pathlib import Path
 
 from agent_framework import Agent, SkillsProvider
 from agent_framework.foundry import FoundryChatClient
 from agent_framework_foundry_hosting import ResponsesHostServer
-from azure.identity import (
-    AzureDeveloperCliCredential,
-    ChainedTokenCredential,
-    DefaultAzureCredential,
-    ManagedIdentityCredential,
-)
+from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 
 from schemas import SynthesisOutput
 
-load_dotenv(override=True)  # override=True required for Foundry-deployed env vars
+
+# Load local .env when running locally.
+# Hosted Agent environment variables remain available through os.environ.
+load_dotenv()
+
+
+def configure_observability() -> None:
+    """Configure Agent Framework tracing when App Insights is available.
+
+    The Foundry Hosted Agent platform may provide
+    APPLICATIONINSIGHTS_CONNECTION_STRING.
+
+    This solution also explicitly passes OTEL_CONNECTION_STRING through
+    agent.yaml. If the platform-provided value is missing or malformed,
+    use the explicit connection string instead.
+    """
+
+    explicit_connection_string = (
+        os.environ.get("OTEL_CONNECTION_STRING")
+        or os.environ.get("APPLICATION_INSIGHTS_CONNECTION_STRING")
+    )
+
+    platform_connection_string = os.environ.get(
+        "APPLICATIONINSIGHTS_CONNECTION_STRING",
+        "",
+    )
+
+    # A valid Application Insights connection string should contain
+    # InstrumentationKey=...
+    #
+    # If the platform-injected value is absent or malformed, fall back to
+    # the explicit value supplied by agent.yaml.
+    if "InstrumentationKey=" not in platform_connection_string:
+        if explicit_connection_string:
+            os.environ[
+                "APPLICATIONINSIGHTS_CONNECTION_STRING"
+            ] = explicit_connection_string
+        else:
+            # Avoid handing an invalid value to the tracing stack.
+            os.environ.pop(
+                "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                None,
+            )
+
+    connection_string = os.environ.get(
+        "APPLICATIONINSIGHTS_CONNECTION_STRING"
+    )
+
+    if connection_string:
+        from agent_framework.observability import enable_instrumentation
+
+        # Sensitive-data collection is deliberately disabled because
+        # prior-authorization prompts may contain PHI.
+        enable_instrumentation(
+            enable_sensitive_data=False,
+        )
 
 
 def main() -> None:
-    # --- Observability ---
-    # Bridge legacy APPLICATION_INSIGHTS_CONNECTION_STRING (underscore form,
-    # used by docker-compose .env) to the canonical APPLICATIONINSIGHTS_CONNECTION_STRING
-    # name. In Foundry the platform injects the canonical name directly when
-    # the project has an App Insights connection.
-    #
-    # CAVEAT (current preview): the platform's auto-injection of
-    # APPLICATIONINSIGHTS_CONNECTION_STRING produces a malformed value that
-    # crashes `azure.ai.agentserver.core._tracing` at startup before /readiness
-    # can return 200 (→ 424 session_not_ready). We work around this by reading
-    # our explicit OTEL_CONNECTION_STRING (set in agent.yaml) and overwriting
-    # the broken platform value before the host server is constructed.
-    _explicit_conn = os.environ.get("OTEL_CONNECTION_STRING") or os.environ.get(
-        "APPLICATION_INSIGHTS_CONNECTION_STRING"
+    # -----------------------------------------------------------------------
+    # Observability
+    # -----------------------------------------------------------------------
+
+    configure_observability()
+
+    # -----------------------------------------------------------------------
+    # Foundry runtime configuration
+    # -----------------------------------------------------------------------
+
+    project_endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
+
+    # Prefer the model variable supplied by the Hosted Agent runtime.
+    # Retain MODEL_DEPLOYMENT_NAME and gpt-5.4-mini as fallbacks for
+    # compatibility with the existing accelerator configuration.
+    model = os.environ.get(
+        "AZURE_AI_MODEL_DEPLOYMENT_NAME",
+        os.environ.get(
+            "MODEL_DEPLOYMENT_NAME",
+            "gpt-5.4-mini",
+        ),
     )
-    _platform_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
-    if "InstrumentationKey=" not in _platform_conn:
-        if _explicit_conn:
-            os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"] = _explicit_conn
-        else:
-            os.environ.pop("APPLICATIONINSIGHTS_CONNECTION_STRING", None)
-    _ai_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")
-    if _ai_conn:
-        # Wire MAF OTel instrumentation BEFORE Agent / ResponsesHostServer
-        # construction so all gen_ai.* spans, W3C trace context, and the
-        # agent_name resource attribute (from FOUNDRY_AGENT_NAME) are captured
-        # and exported to App Insights via ResponsesHostServer.
-        # `enable_sensitive_data` attaches prompts, completions, and tool-call
-        # arguments to spans — keep OFF in any shared environment (PHI risk).
-        # Toggle via ENABLE_OTEL_SENSITIVE_DATA=true for local debugging only.
-        from agent_framework.observability import enable_instrumentation
-        enable_instrumentation(
-            enable_sensitive_data=os.environ.get(
-                "ENABLE_OTEL_SENSITIVE_DATA", "false"
-            ).lower() == "true",
-        )
 
-    # --- No MCP tools — synthesis is pure reasoning over agent outputs ---
+    # -----------------------------------------------------------------------
+    # Skills
+    # -----------------------------------------------------------------------
 
-    # --- Skills from local directory ---
-    # SkillsProvider was refactored in agent-framework-core 1.2.0: file-based
-    # construction moved from `SkillsProvider(skill_paths=...)` (initial preview)
-    # to the `SkillsProvider.from_paths(...)` factory. Using the old kwarg form
-    # crashes the agent on import — /readiness never returns 200, so Foundry
-    # raises HTTP 424 session_not_ready.
-    # agent-framework-core registers skill tools with approval_mode
-    # "always_require" by default, which makes the agent emit an
-    # mcp_approval_request and stop instead of returning a result. These skills
-    # are first-party files baked into the image, so opt the read-only tools out
-    # (run_skill_script still requires approval; no skill here ships a script).
+    skills_path = Path(__file__).parent / "skills"
+
     skills_provider = SkillsProvider.from_paths(
-        str(Path(__file__).parent / "skills"),
+        str(skills_path),
         disable_load_skill_approval=True,
         disable_read_skill_resource_approval=True,
     )
 
-    # --- Foundry chat client + Agent (refreshed preview) ---
-    project_endpoint = os.environ.get(
-        "FOUNDRY_PROJECT_ENDPOINT"
-    ) or os.environ["AZURE_AI_PROJECT_ENDPOINT"]
-    model = os.environ.get(
-        "MODEL_DEPLOYMENT_NAME"
-    ) or os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+    # -----------------------------------------------------------------------
+    # Authentication + Foundry model client
+    # -----------------------------------------------------------------------
 
-    # Credential resolution matches Azure-Samples foundry hosted-agent pattern.
-    # See compliance/main.py for the full rationale.
-    _client_id = os.environ.get("AZURE_CLIENT_ID")
-    if _client_id:
-        credential = ChainedTokenCredential(
-            ManagedIdentityCredential(client_id=_client_id),
-            AzureDeveloperCliCredential(
-                tenant_id=os.environ.get("AZURE_TENANT_ID"),
-                process_timeout=60,
-            ),
-        )
-    else:
-        credential = DefaultAzureCredential()
+    # Keep DefaultAzureCredential because this is the credential path already
+    # proven to work inside this Hosted Agent.
+    credential = DefaultAzureCredential()
 
     chat_client = FoundryChatClient(
         project_endpoint=project_endpoint,
         model=model,
         credential=credential,
-        allow_preview=True,
     )
 
-    # default_options enforces SynthesisOutput schema on every agent.run() call.
-    # `store: False` is mandatory in the refreshed preview because the platform
-    # manages conversation history.
+    # -----------------------------------------------------------------------
+    # Synthesis Agent
+    # -----------------------------------------------------------------------
+
     agent = Agent(
         client=chat_client,
         name="synthesis-agent",
-        id="synthesis-agent",  # Must match registered agent name for Foundry Traces correlation
         instructions=(
             "You are the Synthesis Agent for prior authorization review. "
-            "Use your synthesis-decision skill to evaluate the outputs from the "
-            "Compliance, Clinical Reviewer, and Coverage agents through a strict "
-            "3-gate pipeline (Provider → Codes → Medical Necessity) and produce "
-            "a single APPROVE or PEND recommendation with weighted confidence scoring "
-            "and a complete audit trail."
+
+            "Use your synthesis-decision skill to evaluate the outputs from "
+            "the Compliance, Clinical Reviewer, and Coverage agents. "
+
+            "Evaluate the case through the strict three-gate pipeline: "
+
+            "Gate 1: Provider verification. "
+            "Determine whether the provider information is valid and whether "
+            "any provider-related deficiency blocks approval. "
+
+            "Gate 2: Code validation. "
+            "Evaluate the Clinical Reviewer output for diagnosis, procedure, "
+            "ICD-10, CPT, and other coding issues. "
+
+            "Gate 3: Medical necessity and coverage. "
+            "Evaluate the Coverage and Compliance outputs for applicable "
+            "coverage criteria, medical necessity requirements, documentation "
+            "requirements, and policy compliance. "
+
+            "Produce exactly one final recommendation: APPROVE or PEND. "
+
+            "Include weighted confidence scoring, clinical rationale, "
+            "coverage criteria that were met or not met, missing documentation, "
+            "policy references when available, and a complete synthesis "
+            "audit trail. "
+
+            "Do not invent policy references, clinical evidence, provider "
+            "verification results, or coverage criteria that were not supplied "
+            "by the upstream agents. "
+
+            "If required evidence is missing or an approval gate cannot be "
+            "established from the supplied information, prefer PEND rather "
+            "than assuming that the requirement passed. "
+
+            "Your final response must conform to the SynthesisOutput schema."
         ),
         tools=[],
-        context_providers=[skills_provider],
-        default_options={"response_format": SynthesisOutput, "store": False},
+        context_providers=[
+            skills_provider,
+        ],
+        default_options={
+            "response_format": SynthesisOutput,
+            "store": False,
+        },
     )
 
-    # --- Serve as HTTP endpoint via the refreshed Hosted Agents host ---
-    # ResponsesHostServer exposes POST /responses and GET /readiness on port 8088.
+    # -----------------------------------------------------------------------
+    # Hosted Agent HTTP server
+    # -----------------------------------------------------------------------
+
     ResponsesHostServer(agent).run()
 
 

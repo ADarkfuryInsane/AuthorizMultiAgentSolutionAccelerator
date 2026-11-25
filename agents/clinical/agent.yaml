@@ -1,46 +1,54 @@
 # Foundry Hosted Agent descriptor — Clinical Reviewer Agent.
 #
-# Consumed by the `azd ai agent` extension at deploy time. Companion entry
-# in repo-root azure.yaml `services:` provides build context + remoteBuild.
+# Consumed by the `azd ai agent` extension at deploy time.
+# The companion entry in repo-root azure.yaml under `services:`
+# provides the build context and remoteBuild configuration.
 #
-# Schema reference (canonical):
-#   https://github.com/Azure-Samples/foundry-hosted-agentframework-demos/blob/main/agents/agent.yaml
+# Schema reference:
+# https://github.com/Azure-Samples/foundry-hosted-agentframework-demos/blob/main/agents/agent.yaml
 #
-# MCP tools (ICD-10, PubMed, ClinicalTrials.gov) are wired IN-CONTAINER via
-# `MCPStreamableHTTPTool` in main.py — Hosted Agents v2 does not accept the
-# legacy MCPTool entries that the Foundry Agent Service / Assistants API
-# used to expose. We pass each MCP server URL as an env var that main.py
-# reads and converts to an in-process MCP tool.
+# MCP tools (ICD-10, PubMed, ClinicalTrials.gov) are wired
+# IN-CONTAINER via MCPStreamableHTTPTool in main.py.
+#
+# Hosted Agents v2 does not use the legacy MCPTool entries here.
+# MCP server URLs are passed as environment variables and main.py
+# converts them into in-process MCP tools.
+
 kind: hosted
+
 name: clinical-reviewer-agent
+
 protocols:
   - protocol: responses
     version: "2.0.0"
-resources:
-  cpu: "1"
-  memory: 2Gi
+
 environment_variables:
-  # Model deployment (canonical + legacy fallback names).
+  # Model deployment name
   - name: MODEL_DEPLOYMENT_NAME
     value: ${AZURE_OPENAI_DEPLOYMENT_NAME}
+
+  # Legacy/local-development fallback
   - name: AZURE_OPENAI_DEPLOYMENT_NAME
     value: ${AZURE_OPENAI_DEPLOYMENT_NAME}
+
+  # Foundry project endpoint fallback
   - name: AZURE_AI_PROJECT_ENDPOINT
     value: ${AI_FOUNDRY_PROJECT_ENDPOINT}
-  # App Insights connection string — the platform's auto-injection of the
-  # reserved APPLICATIONINSIGHTS_CONNECTION_STRING is malformed in the
-  # current preview, which crashes the agent host's tracing init at startup
-  # (`ValueError: Invalid connection string`). main.py reads this fallback
-  # name and overrides the broken value before ResponsesHostServer construction.
+
+  # Application Insights / OpenTelemetry connection string
   - name: OTEL_CONNECTION_STRING
     value: ${APPLICATION_INSIGHTS_CONNECTION_STRING}
-  # MCP endpoints — main.py builds MCPStreamableHTTPTool entries from these.
-  # All MCPs are stateless and live on Anthropic's healthcare gateway
-  # (hcls.mcp.claude.com); PubMed is on its own subdomain.
+
+  # ICD-10 MCP endpoint
   - name: MCP_ICD10_CODES
     value: https://hcls.mcp.claude.com/icd10_codes/mcp
+
+  # PubMed MCP endpoint
   - name: MCP_PUBMED
     value: https://pubmed.mcp.claude.com/mcp
+
+  # ClinicalTrials.gov MCP endpoint
   - name: MCP_CLINICAL_TRIALS
     value: https://hcls.mcp.claude.com/clinical_trials/mcp
+
 tools: []

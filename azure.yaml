@@ -4,9 +4,12 @@ requiredVersions:
     azd: '>= 1.24.0'
     extensions:
         azure.ai.agents: '>= 0.1.27-preview'
+
 name: prior-auth-maf
+
 metadata:
     template: prior-auth-maf@1.0
+
 services:
     clinical-reviewer-agent:
         project: ./agents/clinical
@@ -14,48 +17,36 @@ services:
         language: docker
         docker:
             remoteBuild: true
-        config:
-            container:
-                resources:
-                    cpu: "1"
-                    memory: 2Gi
-            startupCommand: python main.py
+        $ref: ./agents/clinical/agent.yaml
+        startupCommand: python main.py
+
     compliance-agent:
         project: ./agents/compliance
         host: azure.ai.agent
         language: docker
         docker:
             remoteBuild: true
-        config:
-            container:
-                resources:
-                    cpu: "0.5"
-                    memory: 1Gi
-            startupCommand: python main.py
+        $ref: ./agents/compliance/agent.yaml
+        startupCommand: python main.py
+
     coverage-assessment-agent:
         project: ./agents/coverage
         host: azure.ai.agent
         language: docker
         docker:
             remoteBuild: true
-        config:
-            container:
-                resources:
-                    cpu: "1"
-                    memory: 2Gi
-            startupCommand: python main.py
+        $ref: ./agents/coverage/agent.yaml
+        startupCommand: python main.py
+
     synthesis-agent:
         project: ./agents/synthesis
         host: azure.ai.agent
         language: docker
         docker:
             remoteBuild: true
-        config:
-            container:
-                resources:
-                    cpu: "1"
-                    memory: 2Gi
-            startupCommand: python main.py
+        $ref: ./agents/synthesis/agent.yaml
+        startupCommand: python main.py
+        
 hooks:
     postdeploy:
         windows:
